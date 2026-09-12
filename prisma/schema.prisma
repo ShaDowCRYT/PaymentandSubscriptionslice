@@ -1,0 +1,67 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PlanType {
+  FREE
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum PaymentEventType {
+  INITIATED
+  VERIFIED
+  FULFILLED
+  FAILED
+}
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  userId             String             @unique
+  plan               PlanType           @default(FREE)
+  status             SubscriptionStatus @default(ACTIVE)
+  flutterwavePlanId  String?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean            @default(false)
+  pendingDowngradeTo PlanType?
+  cancellationReason String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  paymentEvents      PaymentEvent[]
+
+  @@map("subscriptions")
+}
+
+model PaymentEvent {
+  id                 String            @id @default(cuid())
+  userId             String
+  subscriptionId     String?
+  subscription       Subscription?     @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  eventType          PaymentEventType
+  txRef              String
+  providerReference  String?
+  amountMinor        Int
+  currency           String
+  rawPayload         Json?
+  createdAt          DateTime          @default(now())
+
+  @@unique([providerReference, eventType])
+  @@index([userId])
+  @@index([txRef])
+  @@map("payment_log")
+}
