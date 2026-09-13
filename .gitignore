@@ -41,3 +41,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# auto-generated prisma skill dirs
+.claude/
+.cursor/
+.devin/
