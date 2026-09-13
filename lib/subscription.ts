@@ -28,11 +28,81 @@ function periodEndFromNow(plan: PlanType): Date {
 
 export async function getOrCreateSubscription(userId: string): Promise<Subscription> {
   const existing = await prisma.subscription.findUnique({ where: { userId } });
-  if (existing) return existing;
+  if (!existing) {
+    return prisma.subscription.create({
+      data: { userId, plan: "FREE", status: "ACTIVE" },
+    });
+  }
 
-  return prisma.subscription.create({
-    data: { userId, plan: "FREE", status: "ACTIVE" },
-  });
+  // Lazy evaluation of scheduled changes (see DOCUMENTATION.md Section 5).
+  return applyDuePlanChanges(userId, existing);
+}
+
+// ---------------------------------------------------------------------------
+// Lazy evaluation of deferred plan changes
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply any plan change that became due once the current billing period ended.
+ *
+ * - cancelAtPeriodEnd (true) → plan becomes FREE, flags cleared, period reset
+ *   (currentPeriodEnd null — FREE has no billing cycle).
+ * - pendingDowngradeTo (set) → plan becomes that plan, field cleared, and a
+ *   fresh period starts now (currentPeriodEnd = now + that plan's interval).
+ *
+ * Deliberately lazy rather than scheduler-driven (no cron / Vercel Cron /
+ * Trigger.dev): the flip runs on the user's next request that touches their
+ * subscription state, not exactly at the moment the period ends. The tradeoff
+ * is documented in DOCUMENTATION.md Section 5. Idempotent — after a change is
+ * applied, nothing further is due until the fresh period elapses.
+ */
+export async function applyDuePlanChanges(
+  userId: string,
+  existing?: Subscription
+): Promise<Subscription> {
+  const sub =
+    existing ?? (await prisma.subscription.findUnique({ where: { userId } }));
+
+  if (!sub) {
+    return prisma.subscription.create({
+      data: { userId, plan: "FREE", status: "ACTIVE" },
+    });
+  }
+
+  // Nothing is due until a paid period exists and has actually ended.
+  if (!sub.currentPeriodEnd || sub.currentPeriodEnd >= new Date()) {
+    return sub;
+  }
+
+  // Period ended — whichever change was scheduled now takes effect.
+  if (sub.cancelAtPeriodEnd) {
+    return prisma.subscription.update({
+      where: { id: sub.id },
+      data: {
+        plan: "FREE",
+        cancelAtPeriodEnd: false,
+        pendingDowngradeTo: null,
+        cancellationReason: null,
+        currentPeriodEnd: null,
+      },
+    });
+  }
+
+  if (sub.pendingDowngradeTo) {
+    return prisma.subscription.update({
+      where: { id: sub.id },
+      data: {
+        plan: sub.pendingDowngradeTo,
+        cancelAtPeriodEnd: false,
+        pendingDowngradeTo: null,
+        cancellationReason: null,
+        // Paid plan has its own billing cycle — start the new period now.
+        currentPeriodEnd: periodEndFromNow(sub.pendingDowngradeTo),
+      },
+    });
+  }
+
+  return sub;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,9 +287,9 @@ export async function cancelSubscription(
   userId: string,
   reason?: string
 ): Promise<{ success: boolean; error?: string }> {
-  const sub = await prisma.subscription.findUnique({ where: { userId } });
+  const sub = await applyDuePlanChanges(userId);
 
-  if (!sub || sub.plan === "FREE") {
+  if (sub.plan === "FREE") {
     return { success: false, error: "No active paid subscription to cancel" };
   }
 
@@ -245,9 +315,9 @@ export async function cancelSubscription(
 export async function reactivateSubscription(
   userId: string
 ): Promise<{ success: boolean; error?: string }> {
-  const sub = await prisma.subscription.findUnique({ where: { userId } });
+  const sub = await applyDuePlanChanges(userId);
 
-  if (!sub || !sub.cancelAtPeriodEnd) {
+  if (!sub.cancelAtPeriodEnd) {
     return { success: false, error: "No pending cancellation to reactivate" };
   }
 
