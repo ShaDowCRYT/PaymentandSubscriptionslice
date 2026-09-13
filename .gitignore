@@ -43,6 +43,7 @@ yarn-error.log*
 next-env.d.ts
 
 # auto-generated prisma skill dirs
+.agents/
 .claude/
 .cursor/
 .devin/
