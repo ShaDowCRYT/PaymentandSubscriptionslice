@@ -11,28 +11,30 @@ export default function CheckoutReturnPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const txRef = searchParams.get("tx_ref");
-    const transactionId = searchParams.get("transaction_id");
-    const flwStatus = searchParams.get("status");
-    const plan = searchParams.get("plan");
-
     // Landing on this page alone does NOT grant entitlement (PRD trap #2).
     // The page triggers server-side verification — visiting the URL directly
     // without a valid transaction_id shows an error, never a subscription.
 
-    if (!txRef || !transactionId) {
-      setStatus("error");
-      setError("Missing payment information. Please try again from the Plans page.");
-      return;
-    }
-
-    if (flwStatus === "cancelled") {
-      setStatus("error");
-      setError("Payment was cancelled. No charge was made.");
-      return;
-    }
-
     async function verify() {
+      const txRef = searchParams.get("tx_ref");
+      const transactionId = searchParams.get("transaction_id");
+      const flwStatus = searchParams.get("status");
+      const plan = searchParams.get("plan");
+
+      if (!txRef || !transactionId) {
+        setStatus("error");
+        setError(
+          "Missing payment information. Please try again from the Plans page."
+        );
+        return;
+      }
+
+      if (flwStatus === "cancelled") {
+        setStatus("error");
+        setError("Payment was cancelled. No charge was made.");
+        return;
+      }
+
       setStatus("verifying");
       try {
         // We use the same webhook verification logic server-side.
