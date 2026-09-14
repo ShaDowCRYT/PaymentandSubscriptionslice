@@ -23,13 +23,14 @@ export interface ProrationResult {
  * Calculate the prorated charge when upgrading mid-cycle.
  *
  * Formula:
- *   daysRemaining  = ceil((currentPeriodEnd − now) / msPerDay)
+ *   daysRemaining  = floor((currentPeriodEnd − now) / msPerDay)
  *   dailyRate      = currentPlanAmount / totalDays
  *   credit         = floor(dailyRate × daysRemaining)
  *   netCharge      = max(0, newPlanAmount − credit)
  *
- * All rounding is integer-safe: floor() on the credit means the platform
- * never over-credits; the user is charged at most the full new-plan price.
+ * All rounding is integer-safe: floor() on days remaining and on the credit
+ * means the platform never over-credits; the user is charged at most the full
+ * new-plan price.
  */
 export function calculateProration(
   currentPlan: PlanType,
@@ -47,7 +48,7 @@ export function calculateProration(
   // Days remaining: how much of the current period is unused
   const daysRemaining = Math.max(
     0,
-    Math.ceil((currentPeriodEnd.getTime() - now.getTime()) / msPerDay)
+    Math.floor((currentPeriodEnd.getTime() - now.getTime()) / msPerDay)
   );
 
   // Credit for unused days on the current plan

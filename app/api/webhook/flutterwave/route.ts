@@ -48,24 +48,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Unknown transaction" }, { status: 400 });
     }
 
-    // Determine the plan from the redirect URL or metadata
-    // Since we store the plan in the redirect URL during checkout, we need to
-    // determine it from the subscription's context
-    const sub = await prisma.subscription.findUnique({
-      where: { userId: initiatedEvent.userId },
-    });
-
-    // Default to figuring out the plan from the amount
-    let plan: PlanType = "MONTHLY";
-    if (sub?.pendingDowngradeTo) {
-      plan = sub.pendingDowngradeTo;
-    } else {
-      // Infer from the initiated event amount
-      // ₦48,000 (4_800_000 kobo) = YEARLY, else MONTHLY
-      if (initiatedEvent.amountMinor >= 4_800_000) {
-        plan = "YEARLY";
-      }
-    }
+    // Resolve the intended plan from the INITIATED event, where checkout
+    // initiation recorded it in rawPayload. Never infer it from the amount —
+    // a prorated YEARLY upgrade can be charged less than the full ₦48,000.
+    const { plan: intentPlan } = (initiatedEvent.rawPayload ?? {}) as {
+      plan?: PlanType;
+    };
+    const plan: PlanType = intentPlan ?? "MONTHLY";
 
     const result = await verifyAndFulfill(transactionId, txRef, plan);
 

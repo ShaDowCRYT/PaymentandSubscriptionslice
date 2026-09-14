@@ -132,7 +132,8 @@ export async function initiateCheckout(
     amountMinor = proration.netChargeMinor;
   }
 
-  // Log the INITIATED event
+  // Log the INITIATED event — store the intended plan so fulfillment can
+  // resolve it without guessing from the (possibly prorated) amount.
   await prisma.paymentEvent.create({
     data: {
       userId,
@@ -141,6 +142,7 @@ export async function initiateCheckout(
       txRef,
       amountMinor,
       currency: planConfig.currency,
+      rawPayload: { plan },
     },
   });
 
