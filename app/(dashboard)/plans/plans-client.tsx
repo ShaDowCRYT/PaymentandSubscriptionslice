@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { PLANS, formatAmountMajor } from "@/lib/plans";
+import type { ProrationResult } from "@/lib/proration";
 import type { PlanType } from "@prisma/client";
 
 interface PlansClientProps {
@@ -10,17 +11,27 @@ interface PlansClientProps {
   pendingDowngradeTo: PlanType | null;
 }
 
+interface PendingUpgrade {
+  plan: PlanType;
+  planLabel: string;
+  proration: ProrationResult | null;
+}
+
 export default function PlansClient({
   currentPlan,
   cancelAtPeriodEnd,
   pendingDowngradeTo,
 }: PlansClientProps) {
   const [loading, setLoading] = useState<PlanType | null>(null);
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [pendingUpgrade, setPendingUpgrade] = useState<PendingUpgrade | null>(
+    null
+  );
 
   async function handleSelectPlan(plan: PlanType) {
-    if (plan === currentPlan) return;
+    if (plan === currentPlan || pendingUpgrade) return;
 
     setLoading(plan);
     setError(null);
@@ -28,7 +39,7 @@ export default function PlansClient({
 
     try {
       // For upgrades to paid plans, use the change-plan endpoint first
-      // to get proration info, then redirect to checkout
+      // to get proration info, show it, then let the user confirm checkout.
       const res = await fetch("/api/subscription/change-plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -43,22 +54,12 @@ export default function PlansClient({
       }
 
       if (data.action === "upgrade_requires_payment") {
-        // Redirect to checkout
-        const checkoutRes = await fetch("/api/checkout", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ plan }),
+        // Show the prorated charge and wait for explicit confirmation.
+        setPendingUpgrade({
+          plan,
+          planLabel: data.planLabel ?? PLANS[plan].label,
+          proration: data.proration ?? null,
         });
-
-        const checkoutData = await checkoutRes.json();
-
-        if (!checkoutRes.ok) {
-          setError(checkoutData.error || "Checkout failed");
-          return;
-        }
-
-        // Redirect to Flutterwave payment page
-        window.location.href = checkoutData.paymentLink;
         return;
       }
 
@@ -69,6 +70,35 @@ export default function PlansClient({
       setError("Something went wrong. Please try again.");
     } finally {
       setLoading(null);
+    }
+  }
+
+  async function proceedToCheckout() {
+    if (!pendingUpgrade) return;
+
+    setCheckoutLoading(true);
+    setError(null);
+
+    try {
+      const checkoutRes = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan: pendingUpgrade.plan }),
+      });
+
+      const checkoutData = await checkoutRes.json();
+
+      if (!checkoutRes.ok) {
+        setError(checkoutData.error || "Checkout failed");
+        setCheckoutLoading(false);
+        return;
+      }
+
+      // Redirect to Flutterwave payment page
+      window.location.href = checkoutData.paymentLink;
+    } catch {
+      setError("Something went wrong. Please try again.");
+      setCheckoutLoading(false);
     }
   }
 
@@ -88,6 +118,81 @@ export default function PlansClient({
       {message && (
         <div className="mb-6 rounded-md bg-green-50 p-3 text-sm text-green-700 dark:bg-green-900/20 dark:text-green-400">
           {message}
+        </div>
+      )}
+
+      {pendingUpgrade && (
+        <div className="mb-6 rounded-lg border border-zinc-200 bg-zinc-50 p-6 dark:border-zinc-800 dark:bg-zinc-900">
+          <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+            Confirm upgrade to {pendingUpgrade.planLabel}
+          </h2>
+
+          {pendingUpgrade.proration ? (
+            <div className="mt-4 space-y-2 text-sm text-zinc-600 dark:text-zinc-400">
+              <div className="flex justify-between">
+                <span>{pendingUpgrade.planLabel} — full price</span>
+                <span>
+                  {formatAmountMajor(
+                    pendingUpgrade.proration.newPlanChargeMinor,
+                    pendingUpgrade.proration.currency
+                  )}
+                </span>
+              </div>
+              {pendingUpgrade.proration.creditMinor > 0 && (
+                <div className="flex justify-between">
+                  <span>
+                    Unused {currentPlan.toLowerCase()} credit (
+                    {pendingUpgrade.proration.daysRemaining} of{" "}
+                    {pendingUpgrade.proration.totalDays} days)
+                  </span>
+                  <span>
+                    −
+                    {formatAmountMajor(
+                      pendingUpgrade.proration.creditMinor,
+                      pendingUpgrade.proration.currency
+                    )}
+                  </span>
+                </div>
+              )}
+              <div className="flex justify-between border-t border-zinc-200 pt-2 font-semibold text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">
+                <span>You pay today</span>
+                <span>
+                  {formatAmountMajor(
+                    pendingUpgrade.proration.netChargeMinor,
+                    pendingUpgrade.proration.currency
+                  )}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-4 text-sm text-zinc-600 dark:text-zinc-400">
+              New customers pay{" "}
+              <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                {formatAmountMajor(
+                  PLANS[pendingUpgrade.plan].amountMinor,
+                  PLANS[pendingUpgrade.plan].currency
+                )}
+              </span>{" "}
+              {pendingUpgrade.plan === "MONTHLY" ? "per month" : "per year"} —
+              no proration credit applies.
+            </p>
+          )}
+
+          <div className="mt-6 flex gap-3">
+            <button
+              onClick={proceedToCheckout}
+              disabled={checkoutLoading}
+              className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:cursor-wait disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              {checkoutLoading ? "Opening payment…" : "Proceed to Checkout"}
+            </button>
+            <button
+              onClick={() => setPendingUpgrade(null)}
+              className="rounded-md border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            >
+              Not now
+            </button>
+          </div>
         </div>
       )}
 
@@ -133,7 +238,7 @@ export default function PlansClient({
 
               <button
                 onClick={() => handleSelectPlan(type)}
-                disabled={isCurrent || loading !== null}
+                disabled={isCurrent || loading !== null || pendingUpgrade !== null}
                 className={`mt-6 w-full rounded-md px-4 py-2 text-sm font-medium transition-colors ${
                   isCurrent
                     ? "cursor-default bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-500"
