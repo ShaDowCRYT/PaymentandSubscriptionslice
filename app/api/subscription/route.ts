@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { getSession } from "@/lib/session";
-import { getOrCreateSubscription } from "@/lib/subscription";
+import {
+  getOrCreateSubscription,
+  deriveEntitlementFromLog,
+} from "@/lib/subscription";
 import { PLANS, formatAmountMajor } from "@/lib/plans";
 
 export async function GET() {
@@ -10,16 +13,19 @@ export async function GET() {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    // Reconcile row state lazily, then serve the plan/period from the log —
+    // the subscription row is a synced cache, not the entitlement source.
     const sub = await getOrCreateSubscription(session.userId);
-    const planConfig = PLANS[sub.plan];
+    const entitlement = await deriveEntitlementFromLog(session.userId);
+    const planConfig = PLANS[entitlement.plan];
 
     return NextResponse.json({
       id: sub.id,
-      plan: sub.plan,
+      plan: entitlement.plan,
       status: sub.status,
       planLabel: planConfig.label,
       planPrice: formatAmountMajor(planConfig.amountMinor, planConfig.currency),
-      currentPeriodEnd: sub.currentPeriodEnd?.toISOString() ?? null,
+      currentPeriodEnd: entitlement.currentPeriodEnd?.toISOString() ?? null,
       cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
       pendingDowngradeTo: sub.pendingDowngradeTo,
       cancellationReason: sub.cancellationReason,

@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import { getSession } from "@/lib/session";
 import { prisma } from "@/lib/prisma";
-import { getOrCreateSubscription, getProrationPreview } from "@/lib/subscription";
+import {
+  getOrCreateSubscription,
+  deriveEntitlementFromLog,
+  getProrationPreview,
+} from "@/lib/subscription";
 import { changePlanSchema } from "@/lib/schemas/subscription";
 import { isUpgrade, PLANS } from "@/lib/plans";
 import type { PlanType } from "@prisma/client";
@@ -23,16 +27,19 @@ export async function POST(request: Request) {
     }
 
     const newPlan = parsed.data.plan as PlanType;
-    const sub = await getOrCreateSubscription(session.userId);
+    // Reconcile row state lazily before deciding (row cache + scheduled changes),
+    // then decide on the log-derived entitlement.
+    await getOrCreateSubscription(session.userId);
+    const entitlement = await deriveEntitlementFromLog(session.userId);
 
-    if (newPlan === sub.plan) {
+    if (newPlan === entitlement.plan) {
       return NextResponse.json(
         { error: "You are already on this plan" },
         { status: 400 }
       );
     }
 
-    // Downgrade to FREE — cancel at period end
+    // Downgrade to FREE — cancel at period end (row state, not a payment event)
     if (newPlan === "FREE") {
       await prisma.subscription.update({
         where: { userId: session.userId },
@@ -49,7 +56,7 @@ export async function POST(request: Request) {
     }
 
     // Upgrade: return proration preview — actual payment goes through /api/checkout
-    if (isUpgrade(sub.plan, newPlan)) {
+    if (isUpgrade(entitlement.plan, newPlan)) {
       const proration = await getProrationPreview(session.userId, newPlan);
       return NextResponse.json({
         action: "upgrade_requires_payment",

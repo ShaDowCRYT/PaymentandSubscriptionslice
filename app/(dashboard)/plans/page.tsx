@@ -1,5 +1,8 @@
 import { getSession } from "@/lib/session";
-import { getOrCreateSubscription } from "@/lib/subscription";
+import {
+  getOrCreateSubscription,
+  deriveEntitlementFromLog,
+} from "@/lib/subscription";
 import { redirect } from "next/navigation";
 import PlansClient from "./plans-client";
 
@@ -8,6 +11,7 @@ export default async function PlansPage() {
   if (!session) redirect("/signin");
 
   const sub = await getOrCreateSubscription(session.userId);
+  const entitlement = await deriveEntitlementFromLog(session.userId);
 
   return (
     <div>
@@ -20,7 +24,7 @@ export default async function PlansPage() {
 
       <div className="mt-8">
         <PlansClient
-          currentPlan={sub.plan}
+          currentPlan={entitlement.plan}
           cancelAtPeriodEnd={sub.cancelAtPeriodEnd}
           pendingDowngradeTo={sub.pendingDowngradeTo}
         />

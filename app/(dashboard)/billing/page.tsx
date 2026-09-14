@@ -1,5 +1,8 @@
 import { getSession } from "@/lib/session";
-import { getOrCreateSubscription } from "@/lib/subscription";
+import {
+  getOrCreateSubscription,
+  deriveEntitlementFromLog,
+} from "@/lib/subscription";
 import { PLANS, formatAmountMajor } from "@/lib/plans";
 import { redirect } from "next/navigation";
 import { CancelButton, ReactivateButton } from "./billing-actions";
@@ -8,8 +11,11 @@ export default async function BillingPage() {
   const session = await getSession();
   if (!session) redirect("/signin");
 
+  // Entitlement (the plan you're actually on, and until when) comes from the
+  // payment log. Cancellation / downgrade intent stays the row's mutable state.
   const sub = await getOrCreateSubscription(session.userId);
-  const planConfig = PLANS[sub.plan];
+  const entitlement = await deriveEntitlementFromLog(session.userId);
+  const planConfig = PLANS[entitlement.plan];
 
   return (
     <div>
@@ -36,14 +42,14 @@ export default async function BillingPage() {
           </div>
 
           {/* Price */}
-          {sub.plan !== "FREE" && (
+          {entitlement.plan !== "FREE" && (
             <div className="flex justify-between">
               <dt className="text-sm text-zinc-500 dark:text-zinc-400">
                 Price
               </dt>
               <dd className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
                 {formatAmountMajor(planConfig.amountMinor, planConfig.currency)}{" "}
-                / {sub.plan === "MONTHLY" ? "month" : "year"}
+                / {entitlement.plan === "MONTHLY" ? "month" : "year"}
               </dd>
             </div>
           )}
@@ -69,13 +75,13 @@ export default async function BillingPage() {
           </div>
 
           {/* Renewal / Period End */}
-          {sub.currentPeriodEnd && (
+          {entitlement.currentPeriodEnd && (
             <div className="flex justify-between">
               <dt className="text-sm text-zinc-500 dark:text-zinc-400">
                 {sub.cancelAtPeriodEnd ? "Access Until" : "Renewal Date"}
               </dt>
               <dd className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                {sub.currentPeriodEnd.toLocaleDateString("en-GB", {
+                {entitlement.currentPeriodEnd.toLocaleDateString("en-GB", {
                   day: "numeric",
                   month: "long",
                   year: "numeric",
@@ -122,7 +128,7 @@ export default async function BillingPage() {
           </a>
 
           <CancelButton
-            plan={sub.plan}
+            plan={entitlement.plan}
             cancelAtPeriodEnd={sub.cancelAtPeriodEnd}
           />
 

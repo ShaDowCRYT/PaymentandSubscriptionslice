@@ -1,5 +1,8 @@
 import { getSession } from "@/lib/session";
-import { getOrCreateSubscription } from "@/lib/subscription";
+import {
+  getOrCreateSubscription,
+  deriveEntitlementFromLog,
+} from "@/lib/subscription";
 import { PLANS, formatAmountMajor } from "@/lib/plans";
 import { redirect } from "next/navigation";
 
@@ -8,7 +11,8 @@ export default async function DashboardPage() {
   if (!session) redirect("/signin");
 
   const sub = await getOrCreateSubscription(session.userId);
-  const planConfig = PLANS[sub.plan];
+  const entitlement = await deriveEntitlementFromLog(session.userId);
+  const planConfig = PLANS[entitlement.plan];
 
   return (
     <div>
@@ -29,10 +33,10 @@ export default async function DashboardPage() {
             <p className="mt-1 text-xl font-semibold text-zinc-900 dark:text-zinc-100">
               {planConfig.label}
             </p>
-            {sub.plan !== "FREE" && (
+            {entitlement.plan !== "FREE" && (
               <p className="mt-0.5 text-sm text-zinc-500 dark:text-zinc-400">
                 {formatAmountMajor(planConfig.amountMinor, planConfig.currency)}{" "}
-                / {sub.plan === "MONTHLY" ? "month" : "year"}
+                / {entitlement.plan === "MONTHLY" ? "month" : "year"}
               </p>
             )}
           </div>
@@ -50,10 +54,10 @@ export default async function DashboardPage() {
           </span>
         </div>
 
-        {sub.cancelAtPeriodEnd && sub.currentPeriodEnd && (
+        {sub.cancelAtPeriodEnd && entitlement.currentPeriodEnd && (
           <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">
             Cancels at end of period:{" "}
-            {sub.currentPeriodEnd.toLocaleDateString("en-GB", {
+            {entitlement.currentPeriodEnd.toLocaleDateString("en-GB", {
               day: "numeric",
               month: "long",
               year: "numeric",
@@ -72,7 +76,7 @@ export default async function DashboardPage() {
             href="/plans"
             className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
           >
-            {sub.plan === "FREE" ? "Upgrade" : "Change Plan"}
+            {entitlement.plan === "FREE" ? "Upgrade" : "Change Plan"}
           </a>
           <a
             href="/billing"

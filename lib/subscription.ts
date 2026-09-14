@@ -23,6 +23,78 @@ function periodEndFromNow(plan: PlanType): Date {
 }
 
 // ---------------------------------------------------------------------------
+// Log-derived entitlement
+// ---------------------------------------------------------------------------
+
+export interface DerivedEntitlement {
+  plan: PlanType;
+  currentPeriodEnd: Date | null;
+}
+
+/**
+ * Derive what a user is currently entitled to, from the payment_log where the
+ * log has anything current to say, and from the reconciled row once it doesn't.
+ *
+ * While the latest FULFILLED event's grant is still active (now < its
+ * grantedPeriodEnd in rawPayload), that log row is authoritative: it is what
+ * was genuinely paid for and until when, immune to a corrupted or stale
+ * subscriptions.plan / currentPeriodEnd cache.
+ *
+ * If there is no FULFILLED event, or its grant has already elapsed (now >=
+ * grantedPeriodEnd), the log has nothing current to say — non-payment intent
+ * (downgrade, cancellation) and actual renewal are not log events. Authority
+ * passes to applyDuePlanChanges, the existing reconciliation, and its result is
+ * returned instead.
+ *
+ * Cancellation / downgrade intent (cancelAtPeriodEnd, pendingDowngradeTo,
+ * cancellationReason) is deliberately NOT log-derived — it is not a payment
+ * event, so it lives as mutable state on the subscription row instead.
+ *
+ * If the latest FULFILLED event exists but lacks a derivable payload, fall back
+ * to the reconciled state rather than guessing — never over-grant.
+ */
+export async function deriveEntitlementFromLog(
+  userId: string
+): Promise<DerivedEntitlement> {
+  const fulfilled = await prisma.paymentEvent.findFirst({
+    where: { userId, eventType: "FULFILLED" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  // No grant on record → nothing current in the log; reconciled state governs.
+  if (!fulfilled) {
+    return applyDuePlanChanges(userId);
+  }
+
+  const payload = (fulfilled.rawPayload ?? {}) as {
+    intendedPlan?: PlanType;
+    grantedPeriodEnd?: string;
+  };
+
+  if (!payload.intendedPlan || !payload.grantedPeriodEnd) {
+    console.error(
+      `FULFILLED event ${fulfilled.id} (tx ${fulfilled.txRef}) is missing ` +
+        `rawPayload.{intendedPlan, grantedPeriodEnd} — falling back to reconciled state`
+    );
+    return applyDuePlanChanges(userId);
+  }
+
+  const grantedPeriodEnd = new Date(payload.grantedPeriodEnd);
+
+  // The grant is authoritative only while it is still current. Once it has
+  // elapsed, only the reconciled row captures what happens next (scheduled
+  // downgrade, cancellation, renewal), so authority passes to it.
+  if (grantedPeriodEnd <= new Date()) {
+    return applyDuePlanChanges(userId);
+  }
+
+  return {
+    plan: payload.intendedPlan,
+    currentPeriodEnd: grantedPeriodEnd,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Get or create subscription
 // ---------------------------------------------------------------------------
 
@@ -121,14 +193,24 @@ export async function initiateCheckout(
   customerName: string
 ): Promise<CheckoutResult> {
   const sub = await getOrCreateSubscription(userId);
+  const entitlement = await deriveEntitlementFromLog(userId);
   const planConfig = PLANS[plan];
   const txRef = generateTxRef();
 
   let amountMinor = planConfig.amountMinor;
 
-  // If upgrading mid-cycle, prorate
-  if (sub.plan !== "FREE" && sub.currentPeriodEnd && isUpgrade(sub.plan, plan)) {
-    const proration = calculateProration(sub.plan, plan, sub.currentPeriodEnd);
+  // If upgrading mid-cycle, prorate — based on what was actually paid for
+  // (log-derived), not the row cache.
+  if (
+    entitlement.plan !== "FREE" &&
+    entitlement.currentPeriodEnd &&
+    isUpgrade(entitlement.plan, plan)
+  ) {
+    const proration = calculateProration(
+      entitlement.plan,
+      plan,
+      entitlement.currentPeriodEnd
+    );
     amountMinor = proration.netChargeMinor;
   }
 
@@ -257,7 +339,9 @@ export async function verifyAndFulfill(
     },
   });
 
-  // Log FULFILLED event — idempotent
+  // Log FULFILLED event — idempotent. The granted plan and period end are
+  // recorded in rawPayload so entitlement can later be derived from the log
+  // alone (see deriveEntitlementFromLog) instead of the mutable row cache.
   try {
     await prisma.paymentEvent.create({
       data: {
@@ -268,6 +352,10 @@ export async function verifyAndFulfill(
         providerReference: verification.flwRef,
         amountMinor: Math.round(verification.amountMajor * 100),
         currency: verification.currency,
+        rawPayload: {
+          intendedPlan: plan,
+          grantedPeriodEnd: newPeriodEnd.toISOString(),
+        },
       },
     });
   } catch (e: unknown) {
@@ -290,8 +378,9 @@ export async function cancelSubscription(
   reason?: string
 ): Promise<{ success: boolean; error?: string }> {
   const sub = await applyDuePlanChanges(userId);
+  const entitlement = await deriveEntitlementFromLog(userId);
 
-  if (sub.plan === "FREE") {
+  if (entitlement.plan === "FREE") {
     return { success: false, error: "No active paid subscription to cancel" };
   }
 
@@ -318,13 +407,15 @@ export async function reactivateSubscription(
   userId: string
 ): Promise<{ success: boolean; error?: string }> {
   const sub = await applyDuePlanChanges(userId);
+  const entitlement = await deriveEntitlementFromLog(userId);
 
   if (!sub.cancelAtPeriodEnd) {
     return { success: false, error: "No pending cancellation to reactivate" };
   }
 
-  // Can only reactivate before the period actually ends
-  if (sub.currentPeriodEnd && sub.currentPeriodEnd < new Date()) {
+  // Can only reactivate before the period actually ends — the paid-for access
+  // window, as derived from the log.
+  if (entitlement.currentPeriodEnd && entitlement.currentPeriodEnd < new Date()) {
     return { success: false, error: "Subscription period has already ended" };
   }
 
@@ -344,13 +435,20 @@ export async function reactivateSubscription(
 // ---------------------------------------------------------------------------
 
 export async function getProrationPreview(userId: string, newPlan: PlanType) {
-  const sub = await getOrCreateSubscription(userId);
+  // Trigger lazy row reconciliation first (creates the row, applies scheduled
+  // changes), then decide on the log-derived entitlement.
+  await getOrCreateSubscription(userId);
+  const entitlement = await deriveEntitlementFromLog(userId);
 
-  if (sub.plan === "FREE" || !sub.currentPeriodEnd) {
+  if (entitlement.plan === "FREE" || !entitlement.currentPeriodEnd) {
     return null; // No proration for free → paid, just full price
   }
 
-  return calculateProration(sub.plan, newPlan, sub.currentPeriodEnd);
+  return calculateProration(
+    entitlement.plan,
+    newPlan,
+    entitlement.currentPeriodEnd
+  );
 }
 
 // ---------------------------------------------------------------------------
