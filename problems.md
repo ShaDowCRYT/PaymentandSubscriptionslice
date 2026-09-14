@@ -64,8 +64,14 @@ writing.
 - **Resolution (workaround):** Fulfillment for this session used the checkout
   **return-page** path (`/api/checkout/verify`), which passed the explicit
   `plan` in the redirect URL and verified server-side.
-- **Status:** OPEN — use a tunnel (ngrok/cloudflared) or deploy to exercise
-  webhook-driven fulfillment. Note this hides the bug in #7.
+- **Status:** delivery OPEN — live delivery from Flutterwave still needs a
+  tunnel (ngrok/cloudflared) or a deployment; `localhost` is unreachable from
+  Flutterwave's servers. The handler itself is now exercised locally without a
+  tunnel: the real `charge.completed` payload for the ₦43,000 transaction was
+  replayed twice via `curl` to `localhost:3000/api/webhook/flutterwave` with the
+  correct `verif-hash`, proving the handler processes genuine payloads and the
+  duplicate is detected as `alreadyProcessed` (evidence in DOCUMENTATION.md
+  §5.4 / §6). Note: this originally hid the bug in #7 (now fixed).
 
 ## 6. `.env` keys were entered on commented lines and ignored
 
@@ -135,3 +141,28 @@ downgrade-visibility items are still open.
   error with "column does not exist". In PowerShell, pipe SQL to
   `docker exec -i ... psql` and use single-quoted here-strings (`@'...'@`) so
   embedded double quotes survive.
+
+## 10. DeriveEntitlementFromLog never expires — stale grant after period end
+
+- **Symptom:** Testing the real downgrade scenario (tx 10486956,
+  `pendingDowngradeTo=MONTHLY`, period genuinely expired) — the lazy-eval flip
+  ran, but every entitlement surface still reported the old `YEARLY` plan
+  instead of the scheduled `MONTHLY`.
+- **Investigation:** Traced to `deriveEntitlementFromLog` (`lib/subscription.ts`)
+  — it returned the latest FULFILLED event's `rawPayload` unconditionally and
+  never compared the grant's `grantedPeriodEnd` against the current date.
+- **Cause:** Pure log derivation has no concept of its own expiry. The log is
+  authoritative about what *was* paid for, but once that money's window elapses
+  it is silent about non-payment facts (scheduled downgrade, cancellation,
+  non-renewal) — so a strictly-log-derived entitlement froze the user on the
+  stale grant forever, silently breaking acceptance criterion #3 (downgrade
+  applies at period end).
+- **Resolution (fix):** Added the period-cutoff comparison — if no FULFILLED
+  event exists, or `now >= grantedPeriodEnd`, `deriveEntitlementFromLog` falls
+  back to the reconciled state via `applyDuePlanChanges` and returns its result
+  (handles scheduled downgrade, cancellation, and lapse). The log remains
+  authoritative while the grant is active (preserving the corrupted-cache
+  immunity proved in the step-4 test), and the reconciled state takes over once
+  it elapses. Documented in DOCUMENTATION.md §5.11; re-verified both ways
+  afterward (grant active → log wins; grant elapsed → MONTHLY).
+- **Status:** FIXED.
