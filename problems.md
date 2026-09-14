@@ -86,10 +86,12 @@ writing.
 - **Evidence:** The live YEARLY upgrade was charged ₦43,000 and fulfilled
   correctly only because the return-page path supplied `plan=YEARLY`; the
   webhook path was never exercised.
-- **Resolution:** NOT FIXED (deferred). Options: store the original plan in the
-  INITIATED event / `rawPayload` and resolve it from there; store a
-  `pendingUpgradeTo` on the subscription; or pass the plan through
-  Flutterwave `custom_metadata` and read it back on the webhook.
+- **Resolution:** FIXED — checkout initiation stores the intended plan in the
+  INITIATED event's `rawPayload` (`lib/subscription.ts`), and the webhook
+  handler reads it back (`app/api/webhook/flutterwave/route.ts`) instead of
+  inferring from `amountMinor`. (Static-entitlement alternative considered and
+  rejected: `pendingUpgradeTo` on the subscription is unnecessary state when
+  the plan is already on the event.)
 
 ## 8. Proration audit findings (not yet fixed)
 
@@ -104,9 +106,10 @@ Analysis of `lib/proration.ts` / `lib/subscription.ts` / the change-plan route:
   functions, flipping plan, clearing flags, and resetting `currentPeriodEnd`
   once the period has passed. The tradeoff (flip happens on next user activity,
   not exactly at period end) is documented in DOCUMENTATION.md §5.8.
-- **MEDIUM — `Math.ceil` over-credits.** `lib/proration.ts:50` rounds days
-  remaining up: even a millisecond left in the period grants a full extra day of
-  credit. `Math.floor` is the platform-favoring convention.
+- **MEDIUM — `Math.ceil` over-credited.** `lib/proration.ts` used to round days
+  remaining up: even a millisecond left in the period granted a full extra day of
+  credit. **FIXED** — now uses `Math.floor`, so partial days at period end are
+  not over-credited.
 - **MEDIUM — The daily rate assumes the configured period length.**
   `totalDays = PLANS[currentPlan].intervalDays` (`lib/proration.ts:45`); the
   actual billing period is never stored (`currentPeriodStart` is absent from
@@ -115,7 +118,9 @@ Analysis of `lib/proration.ts` / `lib/subscription.ts` / the change-plan route:
   upgrades; downgrades are silently deferred with no credit/effective-date
   shown to the user.
 
-**Status:** OPEN — audit complete, fixes deliberately not implemented yet.
+**Status:** PARTIALLY FIXED — deferred downgrades (lazy eval) and days-remaining
+rounding (`Math.floor`) are fixed; the `totalDays`-assumption and
+downgrade-visibility items are still open.
 
 ## 9. Windows / PowerShell 5.1 tooling quirks (not app bugs)
 

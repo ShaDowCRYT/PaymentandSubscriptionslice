@@ -102,7 +102,7 @@ Webhooks → Secret Hash) and must match `.env`.
 Formula (`lib/proration.ts`):
 
 ```
-daysRemaining  = ceil((currentPeriodEnd − now) / 1 day)
+daysRemaining  = floor((currentPeriodEnd − now) / 1 day)
 dailyRate      = currentPlanAmount / currentPlanIntervalDays
 credit         = floor(dailyRate × daysRemaining)
 netCharge      = max(0, newPlanAmount − credit)
