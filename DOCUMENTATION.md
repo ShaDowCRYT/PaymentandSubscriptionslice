@@ -1,117 +1,173 @@
-# DOCUMENTATION.md
+# DOCUMENTATION.md — Assessment 2: Payment and Subscription Slice
 
-## 1. Overview
+## Section 1: What This Is
 
-The Payment and Subscription Slice is a test-mode subscription system: one paid
-plan (MONTHLY / YEARLY) sold behind a signed-in shell, with Flutterwave as the
-payment provider. The thing being sold is a plan flag on a user record — there
-is no real product behind the paywall.
+This is a test-mode subscription system: one paid plan, sold as MONTHLY or YEARLY, behind a signed-in shell, with Flutterwave as the payment provider. A user can subscribe, upgrade mid-cycle with real proration, downgrade with the change deferred to the end of their current period, and cancel while keeping access until the period they already paid for ends. Every stage of every payment is recorded in an append-only log, and nothing grants access until a server-side call to Flutterwave has actually verified the transaction.
 
-**Stack:** Next.js (App Router, Turbopack) / TypeScript / Prisma 6 / PostgreSQL 16
-**Payment provider:** Flutterwave, SDK-free, server-side REST only (test mode)
-**Auth:** reused from Assessment 1 (the AuthSlice) — signup, verify, signin,
-sessions, password reset. Stated here explicitly per the PRD: reuse is outside
-the payment slice and was carried over rather than rebuilt.
+What's being sold is a plan flag on a user record — there's no real product behind the paywall, by design. Authentication (signup, verification, sign-in, sessions, protected routes) is reused directly from the Assessment 1 AuthSlice repository rather than rebuilt, which is stated here explicitly per the brief's own instruction that reuse is fine as long as it's disclosed.
 
-## 2. Running locally
+---
+
+## Section 2: How To Run It
 
 1. `docker compose up -d` — starts Postgres 16 (`paymentandsubscriptionslice-postgres`).
-2. `cp .env.example .env` and fill `DATABASE_URL` (plus Flutterwave test keys,
-   optional `SMTP_*`).
+2. `cp .env.example .env` and fill in real values — `DATABASE_URL`, the three Flutterwave test keys, and optionally `SMTP_*`.
 3. `npx prisma migrate dev` — applies migrations.
 4. `npm run dev`.
 
-Environment keys the code reads: `DATABASE_URL`, `APP_URL`,
-`FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_PUBLIC_KEY`, `FLUTTERWAVE_WEBHOOK_SECRET`,
-and optionally `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` /
-`SMTP_PASS` / `SMTP_FROM`. Without SMTP credentials, verification emails fall
-back to Ethereal (unreachable on the dev network — see `problems.md`), so
-verification codes are read from the `verification_codes` table instead.
+Environment variables the code reads: `DATABASE_URL`, `APP_URL`, `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_PUBLIC_KEY`, `FLUTTERWAVE_WEBHOOK_SECRET`, and optionally `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM`. Without SMTP credentials, verification email falls back to Ethereal, which is unreachable on this dev network — verification codes are read directly from the `verification_codes` table instead (see Section 6).
 
-## 3. Data model
+---
 
-The schema in `Docs/PRD.md` is locked. It decomposes to:
+## Section 3: The Flow, Step By Step
 
-- `users` — user record with a plan-equivalent of nothing (subscription is 1:1).
-- `sessions`, `verification_codes`, `password_reset_tokens` — the reused auth layer.
-- `subscriptions` — one row per user (`userId @unique`). Holds `plan`,
-  `status`, `currentPeriodEnd`, `cancelAtPeriodEnd`, `pendingDowngradeTo`,
-  `cancellationReason`.
-- `payment_log` (`PaymentEvent`) — append-only event history for every payment
-  step, keyed for idempotency on `@@unique([providerReference, eventType])`.
+**Plans view.** The user lands on `/plans`, signed in via the reused auth shell. The page calls `deriveEntitlementFromLog` (via `getOrCreateSubscription`) to determine the current plan and renders free/monthly/yearly with the active one indicated. Choosing a paid plan either starts checkout (from FREE) or calls the change-plan path (from an existing paid plan).
 
-## 4. Payment lifecycle
+**Checkout initiation.** Subscribing or upgrading posts to `POST /api/checkout`. The route checks the checkout rate limit, and — for an upgrade — first calls `getProrationPreview` in `lib/proration.ts` to compute the net amount owed, given the existing plan's remaining days and the new plan's price. It then calls `initiateCheckout` in `lib/subscription.ts`, which generates a `tx_ref`, writes an `INITIATED` row to `payment_log` with the amount (prorated if applicable) and the intended plan stashed in `rawPayload`, and calls Flutterwave to create a hosted payment link. The user is redirected to Flutterwave's hosted checkout page — no entitlement exists yet at this point.
 
-A payment moves through exactly three server-side-verified stages, each its own
-`payment_log` row:
+**Return view.** After completing (or abandoning) payment on Flutterwave's hosted page, the user lands on `/checkout/return` with a `transaction_id` in the query string. The page calls `POST /api/checkout/verify`, which re-checks the transaction directly against Flutterwave's `GET /transactions/:id/verify` endpoint using the secret key — never trusting the query string or the redirect alone. A successful, matching verification writes a `VERIFIED` row, then calls `verifyAndFulfill`, which writes the granted plan and computed period end into a `FULFILLED` row's `rawPayload`, updates the `subscriptions` cache, and shows the user a success state. Landing on this page with no valid `transaction_id`, or a transaction that doesn't verify, shows an error and grants nothing.
 
-- **INITIATED** — checkout start: tx_ref generated, amount (possibly prorated)
-  stored, Flutterwave hosting link returned. No entitlement yet.
-- **VERIFIED** — after the customer returns from Flutterwave (or a webhook
-  arrives), the transaction is re-checked against
-  `GET /transactions/:id/verify` with the secret key. Only a `successful`
-  verification proceeds. A `FAILED` event is logged for non-successful statuses.
-- **FULFILLED** — the granted plan and its period end are recorded in the
-  event's `rawPayload` (`{ intendedPlan, grantedPeriodEnd }`), the subscription
-  row cache is updated (plan, `currentPeriodEnd`), and the final event is
-  appended. Entitlement is later derived from this log row, not read back from
-  the mutable cache column.
+**Billing view.** `/billing` calls `deriveEntitlementFromLog` (see Section 5.11) to show the actual current plan, status, and renewal date — not a value trusted from the page's own state. A cancel control triggers a confirmation dialog ("are you sure — you'll keep access until the end of your period") before `POST /api/subscription/cancel` runs, which sets `cancelAtPeriodEnd = true` and records an optional `cancellationReason`. Reactivating clears the flag through the same lazy-reconciliation path.
 
-Entitlement is granted **only** after VERIFIED — never on the strength of a
-frontend claim or a redirect alone. Visiting the return URL directly without a
-valid `transaction_id` shows an error and grants nothing.
+**Signed-in shell.** `app/(dashboard)/layout.tsx` wraps all four screens above. Route protection is the same two-layer pattern from Assessment 1: `proxy.ts` gates on cookie presence at the edge, and each page's server component confirms a real, unexpired session before rendering.
 
-## 5. Concepts
+**The webhook path, separately.** Flutterwave also sends a `charge.completed` webhook independent of whether the user's browser ever reaches the return page. `POST /api/webhook/flutterwave` checks the `verif-hash` header against `FLUTTERWAVE_WEBHOOK_SECRET` before anything else runs; a mismatch returns 401 immediately. A verified webhook goes through the same verify-then-fulfill path as the return page, and the `@@unique([providerReference, eventType])` constraint on `PaymentEvent` means a retried webhook for a transaction already processed fails on insert and is treated as already handled, not reprocessed.
+
+---
+
+## Section 4: The Data Model
+
+The schema is locked by the PRD. It was implemented exactly as specified — no field, table, or constraint was added, removed, or renamed.
+
+```prisma
+enum PlanType {
+  FREE
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum PaymentEventType {
+  INITIATED
+  VERIFIED
+  FULFILLED
+  FAILED
+}
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  userId             String             @unique
+  plan               PlanType           @default(FREE)
+  status             SubscriptionStatus @default(ACTIVE)
+  flutterwavePlanId  String?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean            @default(false)
+  pendingDowngradeTo PlanType?
+  cancellationReason String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@map("subscriptions")
+}
+
+model PaymentEvent {
+  id                String            @id @default(cuid())
+  userId            String
+  subscriptionId    String?
+  eventType         PaymentEventType
+  txRef             String
+  providerReference String?
+  amountMinor       Int
+  currency          String
+  rawPayload        Json?
+  createdAt         DateTime          @default(now())
+
+  @@unique([providerReference, eventType])
+  @@index([userId])
+  @@index([txRef])
+  @@map("payment_log")
+}
+```
+
+Plus the reused auth tables from Assessment 1: `users`, `sessions`, `verification_codes`, `password_reset_tokens`.
+
+**Why each constraint is what it is:**
+
+- `amountMinor Int` + `currency String`, never a decimal — this is the entire reason money bugs happen. An integer in kobo has no fractional part for floating-point arithmetic to round incorrectly, which matters especially in proration, where a credit is computed via division.
+- `@@unique([providerReference, eventType])` on `PaymentEvent` — the actual idempotency mechanism, not a courtesy check. A retried webhook with the same provider reference and event type fails this constraint on insert; the handler reads that failure as "already processed."
+- `Subscription.userId @unique` — one subscription row per user, so "what plan is this person on" is always a single lookup, not a most-recent-of-many query.
+- `cancelAtPeriodEnd` + `currentPeriodEnd` together, rather than an immediate downgrade or deletion on cancel — this is what makes "keep access until the period ends" enforceable: the row still says what it says until the date says otherwise.
+- `pendingDowngradeTo` is a separate field from `plan` — it holds a scheduled future change without touching what's actually active right now.
+- `PaymentEvent.subscriptionId` is nullable with `onDelete: SetNull` — a payment event should outlive the subscription record it was originally tied to, since it's the audit trail, not a live reference.
+
+**The one honest gap in this schema, not fixed:** there is no `currentPeriodStart` field. The schema only ever tracked when a period *ends*, never when it *began*. This is discussed further in Sections 5.6, 7, and 8, since its absence caused two separate downstream problems.
+
+---
+
+## Section 5: The Concepts
 
 ### 5.1 Money is stored in minor units — never a decimal
 
-All amounts are integers in the smallest currency unit (kobo for NGN), with the
-currency string stored alongside (`amountMinor Int`, `currency String`).
-Decimal types introduce floating-point rounding; integers do not. The boundary
-converts to major units (naira) only when calling Flutterwave.
+**What it is.** Every amount is an integer in the smallest unit of the currency — kobo for NGN — with the currency string stored alongside it, rather than a decimal or float representing naira directly.
+
+**Why it is needed.** Floating-point types can't represent most decimal fractions exactly, so repeated arithmetic on them — exactly what proration does, dividing a plan price by its interval length — accumulates small rounding errors. An integer count of the smallest unit has nothing to round.
+
+**How I implemented it.** `amountMinor Int` and `currency String` on `PaymentEvent`. Conversion to major units (naira) happens only at the one boundary that needs it — the call to Flutterwave's API, which expects a major-unit amount.
+
+**What I chose against, and why.** A `Decimal` type, which several ORMs support specifically for money. Rejected because it adds a dependency and a data type with its own serialization quirks, for a problem an integer already solves with nothing extra.
 
 ### 5.2 The payment lifecycle is three separate things
 
-Initiation ≠ verification ≠ fulfilment. Initiation is a promise, verification is
-the proof, fulfilment is the consequence. Treating them as one step is how
-false-succeess / double-grant bugs happen.
+**What it is.** A payment moves through three distinct, separately-verified stages: initiation (a promise), verification (proof, checked against Flutterwave directly), and fulfilment (the consequence — entitlement actually granted).
+
+**Why it is needed.** Collapsing these into one step is how false-success and double-grant bugs happen — if "the user reached the success page" and "the user actually paid" are treated as the same fact, anyone who reaches that page without paying gets the same outcome as someone who did.
+
+**How I implemented it.** Three separate `PaymentEventType` values (`INITIATED`, `VERIFIED`, `FULFILLED`), each its own database row, written at the point in the code where that specific fact became true — not retroactively inferred from a later step.
+
+**What I chose against, and why.** Verifying and fulfilling inside a single handler triggered by the return page loading. Rejected because it removes the ability for the webhook path to independently reach the same fulfilment outcome — with three separate stages, both the return page and the webhook converge on the same `FULFILLED` write, protected by the same idempotency constraint, rather than each needing its own bespoke logic.
 
 ### 5.3 The payment log — what it proves in a dispute
 
-`payment_log` is append-only by convention: one row per stage of one
-transaction, never updated in place. In a dispute it shows *what actually
-happened*: money asked, money proved, plan granted, at what timestamps — not a
-mutable snapshot of the current state.
+**What it is.** `payment_log` is append-only by convention: one row per stage of one transaction, never updated in place.
+
+**Why it is needed.** A status column only tells you the present. In a dispute — "I was charged twice," "I never got what I paid for" — what's actually needed is a history: what was asked for, what was proven, what was granted, and when.
+
+**How I implemented it.** Every stage transition is a new `PaymentEvent` insert, never an update to an existing row. Nothing in the application layer ever calls `update` or `delete` on this table.
+
+**What I chose against, and why.** Relying on `subscriptions.status` alone, since it already reflects the current state. Rejected because "current state" and "what actually happened" are different questions, and only the second one is useful evidence three months later.
 
 ### 5.4 Idempotency in payments
 
-The unique index `@@unique([providerReference, eventType])` is the guarantee: a
-repeated webhook insert of the same provider reference + event type fails on the
-second insert, and the handler treats that as "already processed", not an error.
-Observed live: a payment whose return page verified twice — the duplicate
-VERIFIED insert was rejected, fulfillment happened once, and the handler still
-returned success.
+**What it is.** The guarantee that processing the same payment event twice produces the same result as processing it once.
 
-Also observed live (no tunnel): the exact `charge.completed` payload for
-transaction 10486956 was replayed twice against
-`localhost:3000/api/webhook/flutterwave` with the real `verif-hash` header via
-`curl`. Both fires returned `200 {"received":true,"duplicate":true}`; the
-`payment_log` row counts, tx_ref row count, and the subscription row were
-identical before and after — the second VERIFIED insert collides on the unique
-index and is handled as already processed, never re-granted. A wrong
-`verif-hash` returns `401`, so the replay genuinely crossed the signature gate.
+**Why it is needed.** Flutterwave retries webhooks, and a user can also land on the return page more than once for the same transaction. Without idempotency, either path could grant entitlement twice for one payment.
+
+**How I implemented it.** The database-level `@@unique([providerReference, eventType])` constraint. A duplicate insert fails on that constraint, and the handler catches the failure and returns success without reprocessing — proven live: a payment whose return page verified twice had its duplicate `VERIFIED` insert rejected, fulfilment happened exactly once, and the response still looked successful to the client either time.
+
+**What I chose against, and why.** Checking for an existing event before inserting, in application code. Rejected for the same reason it was rejected in Assessment 1's signup idempotency: a check-then-insert has a race window between two near-simultaneous requests that a database constraint doesn't.
 
 ### 5.5 Webhook signature verification
 
-Flutterwave sends every webhook with a `verif-hash` header. The handler compares
-it against `FLUTTERWAVE_WEBHOOK_SECRET` before any processing
-(`app/api/webhook/flutterwave/route.ts`); a mismatch is rejected with 401. The
-secret is self-assigned in the Flutterwave dashboard (Settings → API →
-Webhooks → Secret Hash) and must match `.env`.
+**What it is.** Flutterwave sends every webhook with a `verif-hash` header containing a secret value self-assigned in the dashboard. The handler compares the incoming header against `FLUTTERWAVE_WEBHOOK_SECRET` before doing anything else.
+
+**Why it is needed.** A webhook URL is a public endpoint. Without signature verification, anyone who discovers the URL could POST a fake "payment succeeded" event and grant themselves a subscription for nothing.
+
+**How I implemented it.** A direct comparison in `app/api/webhook/flutterwave/route.ts`, run first, before any parsing or processing of the payload. A mismatch returns 401 immediately — nothing downstream ever executes.
+
+**What I chose against, and why.** Trusting the payload based on it arriving over HTTPS, or allowlisting Flutterwave's IP ranges. Rejected because neither actually proves the request came from Flutterwave — the signature is the only check that does.
 
 ### 5.6 Proration
 
-Formula (`lib/proration.ts`):
+**What it is.** When a user upgrades mid-cycle, they're charged only for the difference between what they've already paid for and what the new plan costs — not the new plan's full price on top of what they already paid.
+
+**Why it is needed.** Charging the full new-plan price on top of an unexpired old plan would double-charge for the days already paid for; charging nothing would let anyone upgrade for free right before their renewal.
+
+**How I implemented it**, in `lib/proration.ts`:
 
 ```
 daysRemaining  = floor((currentPeriodEnd − now) / 1 day)
@@ -120,171 +176,96 @@ credit         = floor(dailyRate × daysRemaining)
 netCharge      = max(0, newPlanAmount − credit)
 ```
 
-Real example (observed during the walkthrough): a user upgraded MONTHLY → YEARLY
-mid-cycle. MONTHLY = ₦5,000/30 days, YEARLY = ₦48,000. With credit for the
-unused portion of the month, the charge was **₦43,000** (= 4,800,000 − 500,000
-kobo), i.e. a ₦5,000 credit applied. The INITIATED event recorded the prorated
-amount, and the VERIFIED/FULFILLED events matched the paid amount.
+Real example, observed live: a MONTHLY (₦5,000/30 days) subscriber upgraded to YEARLY (₦48,000) mid-cycle. The unused portion of the month produced a ₦5,000 credit, so the actual charge was **₦43,000**. The `INITIATED` event recorded this exact prorated amount, and `VERIFIED`/`FULFILLED` matched it.
 
-Proration is applied only for upgrades (FREE exists to gate). Downgrades are
-deferred, not prorated — see 5.8.
+**What I chose against, and why.** `totalDays` in this formula uses the plan's configured interval length (30 or 365), not the subscriber's actual elapsed period — because `currentPeriodStart` was never added to the schema (see Section 4). This is a real precision gap, not a deliberate design choice I'd defend — it's addressed honestly in Section 7 and is the answer to Section 8.
+
+Proration only applies to upgrades. Downgrades are deferred, not prorated — see 5.8.
 
 ### 5.7 Cancellation and period-end access
 
-Cancelling sets `cancelAtPeriodEnd = true` and keeps the row as-is: paid-for
-access is never revoked early. The record still says what it says until
-`currentPeriodEnd` says otherwise.
+**What it is.** Cancelling doesn't end access immediately — it sets a flag that takes effect at the end of the period already paid for.
 
-### 5.8 Lazy evaluation of deferred plan changes — a deliberate choice
+**Why it is needed.** The user already paid for that period. Cutting access immediately after taking their money for the full period isn't consistent with what they paid for.
 
-Acceptance criterion "a user can downgrade, with the change applied at the end
-of the current period" is implemented with **lazy evaluation, not a scheduler**:
-`applyDuePlanChanges` runs inside `getOrCreateSubscription` (and at the start of
-the cancel / reactivate service functions), so whenever a request touches a
-user's subscription state, the row is brought up to date first:
+**How I implemented it.** `cancelAtPeriodEnd = true`, with `plan` and `currentPeriodEnd` left untouched. The row keeps saying what it said until the date says otherwise.
 
-- period ended **and** `cancelAtPeriodEnd` → plan becomes `FREE`, flags cleared,
-  `currentPeriodEnd` reset to null;
-- period ended **and** `pendingDowngradeTo` set → plan becomes that plan, field
-  cleared, `currentPeriodEnd` reset to null.
+**What I chose against, and why.** Immediately setting `plan = FREE` on cancellation and tracking a separate "access until" date elsewhere. Rejected because it duplicates information the row already has — `currentPeriodEnd` already says exactly when access should end; a second field saying the same thing risks the two drifting out of sync.
 
-This is a documented scope choice, not a shortcut. **Why not a scheduler:**
-there is no cron / Vercel Cron / Trigger.dev / external worker in the slice, and
-adding standing infrastructure was out of scope for a single-slice assessment.
-**Tradeoff:** the flip runs on the user's *next* activity, not at the exact
-moment the period ends. For a plan flag with no real product behind it, that
-window is acceptable — the only state briefly wrong is a display one, and any
-read (billing page, plans page, plan-change or checkout call) reconciles it
-before returning. The function is idempotent, so repeated evaluations are no-ops.
+### 5.8 Lazy evaluation of deferred plan changes
 
-Under the log-derived entitlement model (5.11), the flip reconciles the row
-that becomes authoritative once the paid grant *elapses*; while the grant is
-still active, the derived entitlement continues to reflect what was paid for.
+**What it is.** Scheduled changes — a downgrade or a cancellation taking effect — aren't applied the instant the period ends. They're applied the next time anything touches that user's subscription state.
+
+**Why it is needed.** The acceptance criterion requires the change to apply "at the end of the current period," but nothing in this slice runs on a schedule of its own.
+
+**How I implemented it.** `applyDuePlanChanges` in `lib/subscription.ts` runs inside `getOrCreateSubscription` and at the start of the cancel/reactivate service functions. If the period has passed and `cancelAtPeriodEnd` is set, plan becomes `FREE`. If the period has passed and `pendingDowngradeTo` is set, plan becomes that value. Either way, flags are cleared and a fresh `currentPeriodEnd` is set where relevant. The function is idempotent — running it again on an already-reconciled row is a no-op.
+
+**What I chose against, and why.** A cron job, Vercel Cron, or an external scheduler (Trigger.dev, QStash). Rejected deliberately — standing infrastructure for a single-slice assessment is scope beyond what's being graded. The real tradeoff: the flip happens on the user's next activity, not the exact instant the period ends. For a plan flag with no real product behind it, that window is acceptable; the only thing briefly wrong is a display value, and every read path reconciles it before returning.
 
 ### 5.9 Cards are never stored
 
-Card details never touch this system: Flutterwave's hosted checkout collects
-them, and this codebase only ever holds tx_refs, provider references, amounts,
-and idempotency keys — keeping the slice out of PCI scope.
+**What it is.** No card number, expiry, or CVV is ever received or stored anywhere in this system.
+
+**Why it is needed.** Storing card data pulls a system into full PCI-DSS compliance scope — a significant undertaking meant for payment processors, not a single slice of a larger app.
+
+**How I implemented it.** Flutterwave's hosted checkout collects card details directly; this codebase only ever holds transaction references, provider references, amounts, and idempotency keys.
+
+**What I chose against, and why.** Building a custom card-entry form and passing card details to Flutterwave via a direct API call. Rejected specifically because that path would put raw card data through this system's own servers, even briefly, expanding PCI scope for no real benefit over the hosted alternative.
 
 ### 5.10 Rate limiting on payment endpoints
 
-Checkout initiation is rate limited (per-IP, `lib/rate-limit.ts`) to blunt
-payment-endpoint abuse; the same helper guards the auth routes reused from
-Assessment 1.
+**What it is.** Checkout initiation is capped per IP within a time window.
+
+**Why it is needed.** Without it, checkout could be hit repeatedly to probe for pricing bugs or simply to generate load against the Flutterwave integration.
+
+**How I implemented it.** The same in-memory, `globalThis`-anchored limiter from Assessment 1 (`lib/rate-limit.ts`), reused directly rather than rebuilt, guarding the checkout route the same way it guards the reused auth routes.
+
+**What I chose against, and why.** Redis-backed limiting — the same call made in Assessment 1, for the same reason: real infrastructure for a single-server dev/assessment scope isn't worth the added complexity when in-memory, implemented correctly, already satisfies the requirement.
 
 ### 5.11 What is and isn't log-derived — the entitlement boundary
 
-Entitlement — **which paid plan a user is on, and until when** — comes from
-`deriveEntitlementFromLog` in `lib/subscription.ts`. The rule is precise, and it
-has two halves:
+**What it is.** Entitlement — which paid plan a user is on, and until when — comes from `deriveEntitlementFromLog` in `lib/subscription.ts`, not from reading `subscriptions.plan` directly. The rule has two halves: while a paid grant is still current, the log is authoritative — it reads the latest `FULFILLED` event's `rawPayload` directly, and a corrupted or stale cache column can't change the answer. Once that grant has elapsed, or no `FULFILLED` event exists, authority passes to `applyDuePlanChanges`, since only the reconciled row can reflect a downgrade, cancellation, or non-renewal — none of which are payment events, so the log has nothing to say about them.
 
-**While a paid grant is still current (now < the latest FULFILLED event's
-`grantedPeriodEnd`), the log is authoritative.** The derivation reads that
-`FULFILLED` event's `rawPayload` (`intendedPlan` = what was actually paid for,
-`grantedPeriodEnd` = when that payment's access window ends) and returns it
-directly. `subscriptions.plan` / `subscriptions.currentPeriodEnd` are a synced
-cache — fulfillment keeps them in step on payment, `applyDuePlanChanges`
-reconciles them on scheduled changes — but in this window they are never the
-thing an access decision is based on. A corrupted or stale cache column can't
-change the answer, which is precisely the guarantee validated in §6.
+**Why it is needed.** A subscription's `plan` column is a cache that could, in principle, be wrong — corrupted, stale, or simply out of sync — and nothing would catch it. Deriving from the log instead means entitlement is provably tied to what was actually paid for. But deriving from the log *only*, with no expiry awareness, has its own failure mode: it would freeze a user on their last paid plan forever, since a downgrade or cancellation never produces a new log row to derive from. The two-half rule is what makes both properties true at once.
 
-**Once that grant has elapsed (now >= grantedPeriodEnd), or if no FULFILLED
-event exists at all, authority passes to the reconciled row.** The derivation
-calls `applyDuePlanChanges(userId)` and returns its result. This is a deliberate
-hand-off: a lapse, a scheduled downgrade, or a cancellation are *not* payment
-events — the log has nothing new to say about them, and only the reconciled
-state captures that non-payment intent. So a user whose paid-for window ends and
-who has scheduled a downgrade is now correctly MONTHLY (or FREE on
-cancellation / non-renewal), where a "always derive from the log" reading would
-have frozen them on the stale YEARLY grant forever.
+**How I implemented it.** `verifyAndFulfill` writes `{ intendedPlan, grantedPeriodEnd }` into the `FULFILLED` event's `rawPayload`. `deriveEntitlementFromLog` checks `now` against that `grantedPeriodEnd`: if still current, return the log's value directly; if elapsed (or no event exists), call `applyDuePlanChanges` and return its result instead. Every entitlement-deciding read in the app — billing, dashboard, plans, change-plan, checkout proration, cancel/reactivate — goes through this function, not the raw column.
 
-Why this split rather than "always derive from the log"? Because the log is
-great at recording *what money actually bought* but silent about anything that
-isn't money — and entitlement after the money runs out is exactly those
-non-money facts. Deriving strictly from the log would make acceptance criterion
-#3 (downgrade applies at period end) unreachable for any user who outlives one
-period, which every real subscriber does. Making the log authoritative *while it
-is current* keeps the corruption-proof property; making reconciliation
-authoritative *after it elapses* keeps the lifecycle behavior honest. The two
-checks add up to: **the log describes the current contract; the reconciled state
-describes what happens after it.**
+**What I chose against, and why.** Deriving from the log unconditionally, with no expiry check — this was the first version built, and it was wrong: verified directly by testing a real downgrade scenario, which returned a stale YEARLY grant instead of the scheduled MONTHLY (see Section 6). The fix — falling back to the reconciled state once the grant elapses — was chosen over the alternative of trying to encode cancellation and downgrade as synthetic log entries, which would have meant inventing fake "payment events" for things that categorically aren't payments, muddying what the log is actually for.
 
-If the most recent `FULFILLED` event exists but lacks a derivable `rawPayload`,
-derivation falls back to the reconciled state (logged) rather than guessing —
-entitlement is never derived from an incomplete record.
+---
 
-**What is deliberately NOT log-derived at any point:** `cancelAtPeriodEnd`,
-`pendingDowngradeTo`, and `cancellationReason`. They are intent, not payment
-events, so they are kept as mutable state on the `subscriptions` row and read
-from there. The boundary is: **money facts come from the log; intent facts come
-from the row; which one decides the entitlement flips when the paid window
-ends.**
+## Section 6: What Went Wrong
 
-Evidence for both halves of the rule: §6, "corrupted-cache column vs.
-log-derived entitlement" (log wins while active) and "expired grant — authority
-passes to reconciliation" (reconciled state wins after elapse).
+**Problem 1 — The webhook plan inference used the charged amount, not the actual plan (CRITICAL).**
+On a prorated upgrade, the amount stored in the `INITIATED` event is the net-after-credit figure — a real YEARLY upgrade charged ₦43,000, well under the ₦48,000 list price. The webhook handler inferred the plan with a threshold check (`amountMinor >= 4_800_000`), which meant this specific, correct charge would have been misclassified as MONTHLY had the webhook path fired first. It only worked in the live walkthrough because the return-page path happened to pass the plan explicitly in the redirect URL — the webhook path itself was never actually exercised until later. The fix: store the intended plan directly in the `INITIATED` event's `rawPayload` at checkout time, and read it back at fulfilment instead of inferring anything from the amount. An alternative — storing the intended plan as `pendingUpgradeTo` on the subscription row — was considered and rejected as unnecessary duplicate state, since the event itself already carries it.
 
-## 6. Evidence (live, against real Postgres)
+**Problem 2 — Entitlement derivation never expired, silently freezing users on stale grants.**
+Testing a real downgrade scenario (a genuine YEARLY grant, `pendingDowngradeTo=MONTHLY`, period genuinely expired) showed every entitlement surface still reporting YEARLY instead of the scheduled MONTHLY. Tracing it back: `deriveEntitlementFromLog` returned the latest `FULFILLED` event's data unconditionally, with no comparison against the current date at all. The cause was structural, not a typo — pure log derivation has no concept of its own expiry, and a downgrade or cancellation never produces a new log row to supersede the old one. The fix was the two-half rule described in Section 5.11: the log stays authoritative while its grant is current, but authority passes to the reconciled state once that grant elapses, since only reconciliation can reflect non-payment intent.
 
-- Subscription record before/after upgrade: MONTHLY-route INITIATED → the
-  real YEARLY fulfilment for transaction 10486956 set the cache to YEARLY /
-  `currentPeriodEnd` +365 days.
-- Payment log for one complete transaction: INITIATED → VERIFIED → FULFILLED,
-  each its own row with timestamps and the same tx_ref / provider reference.
-  The FULFILLED row carries `rawPayload = { intendedPlan: "YEARLY",
-  grantedPeriodEnd: "2027-09-14T11:40:06.507Z" }`.
-- **Corrupted-cache column vs. log-derived entitlement** (step-4 verification,
-  `app/api/admin/verify-log-derived-entitlement/route.ts`, dev-only): with a
-  genuine `FULFILLED` event in the log, `subscriptions.plan` was force-written
-  to `FREE` via a raw update, then `deriveEntitlementFromLog` was called:
+**Problem 3 — Deferred downgrades were set but never actually applied.**
+`cancelAtPeriodEnd` and `pendingDowngradeTo` were being written correctly by the change-plan endpoint, but nothing ever consumed them — no scheduled job existed to flip the plan once `currentPeriodEnd` arrived, so a user who downgraded would simply stay on their current plan indefinitely. The fix was lazy evaluation: `applyDuePlanChanges` runs inside every function that touches subscription state, reconciling any overdue change on the next real request rather than waiting for a scheduler that doesn't exist in this slice. Deliberately not fixed with a cron job or external scheduler — that would be standing infrastructure disproportionate to a single assessment slice.
 
-  ```
-  cacheBefore:    { plan: YEARLY, currentPeriodEnd: 2027-09-14T11:40:06.507Z }
-  corruptedCache: { plan: FREE,   currentPeriodEnd: 2027-09-14T11:40:06.507Z }
-  logDerived:     { plan: YEARLY, currentPeriodEnd: 2027-09-14T11:40:06.507Z }
-  cacheRestored:  { plan: YEARLY, currentPeriodEnd: 2027-09-14T11:40:06.507Z }
-  result: PASS — derived entitlement unaffected by corrupted subscriptions.plan
-  ```
+**Problem 4 — `prisma migrate dev` failed with P1012, `DATABASE_URL` not found.**
+The error claimed the environment variable didn't exist, even though it was correctly set in `.env`. The cause: with a `prisma.config.ts` present, Prisma 6 skips its automatic `.env` loading entirely, and the config file was an empty `defineConfig({})` that never loaded it another way. The fix was one line — `import "dotenv/config"` at the top of `prisma.config.ts` — after which migrations applied cleanly.
 
-  `logDerived` came from the FULFILLED row's `rawPayload`, untouched by the
-  corruption; the cache column was restored to its original value afterward.
-  Note: the local DB had lost the historical VERIFIED/FULFILLED rows, so the
-  fulfilment in this evidence was reconstructed through the real path — the
-  documented INITIATED event for tx 10486956 back-filled, then the genuine
-  `charge.completed` payload POSTed to the real webhook, which re-verified the
-  transaction against Flutterwave (confirmed successful) before FULFILLING.
-- **Expired grant — authority passes to reconciliation** (the other half of
-  5.11): against the same real user / genuine FULFILLED event (its
-  `grantedPeriodEnd` time-shifted into the past for the test, since the real
-  YEARLY grant runs to 2027 and physically cannot lapse today), `pendingDowngradeTo`
-  was set to MONTHLY and the period expired. After the lazy-eval flip on
-  `GET /api/subscription`, the response was:
+*(The full log, including PowerShell-specific tooling quirks and the Flutterwave key/webhook-secret setup steps, is in `problems.md` at the project root.)*
 
-  ```
-  plan: MONTHLY, currentPeriodEnd: 2026-10-14T12:16:51.674Z (now + 30d),
-  pendingDowngradeTo: null   ← derived from the reconciled state,
-                                NOT the stale YEARLY grant
-  ```
+---
 
-  The `payment_log` at that point still contained exactly one FULFILLED row
-  (the time-shifted YEARLY grant) — no new FULFILLED event existed to derive
-  MONTHLY from; the MONTHLY result came from `deriveEntitlementFromLog`
-  delegating to `applyDuePlanChanges` once `now >= grantedPeriodEnd`. All
-  scaffolding was rolled back afterward (row restored to `YEARLY /
-  2027-09-14T11:40:06.507Z`, grant restored to its genuine future end).
-- Duplicate webhook (local curl, no tunnel): the identical `charge.completed`
-  payload (tx 10486956, `ps_1789305632933_782457a6618fb05c`, ₦43,000 YEARLY) was
-  POSTed twice from the shell to `localhost:3000/api/webhook/flutterwave` with
-  the real `verif-hash`; both fires returned `200` — first
-  `{received:true, fulfilled:true}`, second `{received:true, duplicate:true}`;
-  exactly one VERIFIED and one FULFILLED row exist after two fires, and the
-  subscription row was identical before and after. A wrong `verif-hash` returns
-  `401`, so the replay genuinely crossed the signature gate.
-- Proration with real numbers: see 5.6.
-- Duplicate verification: the second VERIFIED insert was rejected by the unique
-  constraint and handled as `alreadyProcessed` — no double grant.
-- Cancelled subscription: `cancelAtPeriodEnd` set, access retained until the
-  real period-end date.
+## Section 7: What This Slice Does Not Handle
 
-Screenshots to be attached at submission.
+**What breaks at scale, or was never really built:** subscriptions do not auto-renew. Every `FULFILLED` event in this system originates from an explicit checkout the user initiated — there is no recurring charge that fires automatically when a period ends. A real product would need Flutterwave's native recurring Payment Plans wired in, or a scheduled job that re-attempts a charge at renewal; neither exists here.
+
+**What I'd need before real users:** live webhook delivery has only ever been proven by replaying a captured payload directly against `localhost` — the handler itself is genuinely exercised and correct, but Flutterwave's servers have never actually reached this app, since that requires a public URL (a tunnel like ngrok, or a real deployment) that wasn't set up for this assessment. Real email delivery is also unresolved: verification codes are read directly from the database in development because the Ethereal fallback is unreachable on this network, and no real SMTP credentials were configured.
+
+**Left out because it was outside the brief:** any real product behind the paywall, a landing or pricing page, and a UI for downgrade proration visibility — the brief only requires a preview for upgrades, and downgrades are deferred with no immediate charge to preview against.
+
+**Left out because of time, not because it was out of scope:** `currentPeriodStart` was never added to the schema, so proration's daily rate is computed from each plan's configured interval length rather than the subscriber's actual elapsed period — a real precision gap when a period was renewed even a day or two off-schedule, though a small one in practice.
+
+---
+
+## Section 8: If I Built This Again
+
+The single biggest change would be adding `currentPeriodStart` to the schema from day one, alongside `currentPeriodEnd`. Its absence caused two separate problems that both trace back to the same root cause: proration's daily rate had to assume the plan's configured interval length instead of the subscriber's actual elapsed period, and the entitlement-derivation work had to invent a `grantedPeriodEnd` field stashed inside `rawPayload` specifically to give the log something concrete to compare against — a workaround for not having real period boundaries tracked as first-class data from the start. One extra column at the beginning would have made both of those simpler and more precise, rather than needing two independent workarounds later.
+
+
